@@ -483,26 +483,112 @@ def format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{whole_seconds:02},{milliseconds:03}"
 
 
-def write_transcribed_srt(output_path: Path, segments: list[Any]) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cue_lines: list[str] = []
-    index = 1
-    for segment in segments:
-        text = " ".join(str(getattr(segment, "text", "")).split())
-        if not text:
-            continue
+def sanitize_subtitle_text(text: str) -> str:
+    return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+
+
+def split_long_word(word: str, max_chars: int) -> list[str]:
+    if len(word) <= max_chars:
+        return [word]
+    return [word[index : index + max_chars] for index in range(0, len(word), max_chars)]
+
+
+def wrap_subtitle_text(text: str, max_chars: int) -> list[str]:
+    lines: list[str] = []
+    current_line = ""
+    for word in text.split():
+        pieces = split_long_word(word, max_chars)
+        for piece in pieces:
+            if not current_line:
+                current_line = piece
+            elif len(current_line) + 1 + len(piece) <= max_chars:
+                current_line = f"{current_line} {piece}"
+            else:
+                lines.append(current_line)
+                current_line = piece
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+
+def chunk_subtitle_lines(lines: list[str], max_lines: int) -> list[list[str]]:
+    return [
+        lines[index : index + max_lines]
+        for index in range(0, len(lines), max_lines)
+        if lines[index : index + max_lines]
+    ]
+
+
+def segment_times(segment: Any) -> tuple[float, float] | None:
+    try:
         start = float(getattr(segment, "start", 0.0))
         end = float(getattr(segment, "end", start))
+    except (TypeError, ValueError):
+        return None
+
+    if end <= start:
+        return None
+    return max(0.0, start), max(0.0, end)
+
+
+def build_srt_cues(segments: list[Any], config: dict[str, Any]) -> list[dict[str, Any]]:
+    cues: list[dict[str, Any]] = []
+    previous_end = 0.0
+    max_chars = config["max_chars_per_line"]
+    max_lines = config["max_lines_per_subtitle"]
+
+    for segment in segments:
+        text = sanitize_subtitle_text(str(getattr(segment, "text", "")))
+        if not text:
+            continue
+
+        times = segment_times(segment)
+        if times is None:
+            continue
+        segment_start, segment_end = times
+
+        wrapped_lines = wrap_subtitle_text(text, max_chars)
+        line_chunks = chunk_subtitle_lines(wrapped_lines, max_lines)
+        if not line_chunks:
+            continue
+
+        segment_duration = segment_end - segment_start
+        chunk_duration = segment_duration / len(line_chunks)
+        for chunk_index, lines in enumerate(line_chunks):
+            start = segment_start + (chunk_index * chunk_duration)
+            end = (
+                segment_end
+                if chunk_index == len(line_chunks) - 1
+                else segment_start + ((chunk_index + 1) * chunk_duration)
+            )
+            if start < previous_end:
+                start = previous_end
+            if end <= start:
+                continue
+            cues.append({"start": start, "end": end, "lines": lines})
+            previous_end = end
+
+    return cues
+
+
+def write_transcribed_srt(
+    output_path: Path, segments: list[Any], config: dict[str, Any]
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cue_lines: list[str] = []
+    for index, cue in enumerate(build_srt_cues(segments, config), start=1):
         cue_lines.extend(
             [
                 str(index),
-                f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}",
-                text,
+                (
+                    f"{format_srt_timestamp(cue['start'])} --> "
+                    f"{format_srt_timestamp(cue['end'])}"
+                ),
+                *cue["lines"],
                 "",
             ]
         )
-        index += 1
-    output_path.write_text("\n".join(cue_lines), encoding="utf-8")
+    output_path.write_text("\n".join(cue_lines).rstrip() + "\n", encoding="utf-8")
 
 
 def should_skip_existing_output(
@@ -832,7 +918,7 @@ def process_media_files(
                 media["language"],
                 plan,
             )
-            write_transcribed_srt(output_path, transcription["segments"])
+            write_transcribed_srt(output_path, transcription["segments"], config)
             log_success(
                 project_root,
                 input_path,
