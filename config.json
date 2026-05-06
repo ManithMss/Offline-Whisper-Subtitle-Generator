@@ -1,0 +1,18 @@
+{
+  "overwrite_existing": false,
+  "recursive_scan": true,
+  "cleanup_temp": true,
+  "beam_size": 5,
+  "max_chars_per_line": 42,
+  "max_lines_per_subtitle": 2,
+  "audio_sample_rate": 16000,
+  "audio_channels": 1,
+  "translate_to_english": true,
+  "log_success": true,
+  "log_errors": true,
+  "log_skipped": true,
+  "ffmpeg_timeout_seconds": null,
+  "log_max_bytes": 5242880,
+  "log_backup_count": 3,
+  "write_srt_metadata_note": false
+}
