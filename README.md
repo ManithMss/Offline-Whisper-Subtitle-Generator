@@ -1,0 +1,1 @@
+# Offline-Whisper-Subtitle-Generator
