@@ -80,9 +80,24 @@ LANGUAGE_FOLDERS: dict[str, str | None] = {
     "auto_detect": None,
 }
 
+REQUIRED_MODEL_FILES = (
+    "model.bin",
+    "config.json",
+    "tokenizer.json",
+    "vocabulary.txt",
+)
+
 
 class ConfigValidationError(ValueError):
     """Raised when config.json contains values the project cannot use safely."""
+
+
+class DependencyError(RuntimeError):
+    """Raised when installed Python dependencies are missing or incomplete."""
+
+
+class ModelFilesError(RuntimeError):
+    """Raised when local Faster-Whisper model files are missing or incomplete."""
 
 
 def get_project_root() -> Path:
@@ -251,6 +266,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing subtitles for this run.",
     )
+    parser.add_argument("--device", choices=("cpu", "cuda"), help="Override device.")
+    parser.add_argument("--model", choices=("small", "medium"), help="Override model.")
     return parser.parse_args()
 
 
@@ -458,15 +475,34 @@ def validate_wav(
     return True
 
 
-def write_placeholder_srt(output_path: Path, input_path: Path) -> None:
+def format_srt_timestamp(seconds: float) -> str:
+    milliseconds = max(0, round(seconds * 1000))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02}:{minutes:02}:{whole_seconds:02},{milliseconds:03}"
+
+
+def write_transcribed_srt(output_path: Path, segments: list[Any]) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    content = (
-        "1\n"
-        "00:00:00,000 --> 00:00:02,000\n"
-        "[Placeholder subtitle - Whisper integration pending]\n"
-        f"# Source: {input_path}\n"
-    )
-    output_path.write_text(content, encoding="utf-8")
+    cue_lines: list[str] = []
+    index = 1
+    for segment in segments:
+        text = " ".join(str(getattr(segment, "text", "")).split())
+        if not text:
+            continue
+        start = float(getattr(segment, "start", 0.0))
+        end = float(getattr(segment, "end", start))
+        cue_lines.extend(
+            [
+                str(index),
+                f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}",
+                text,
+                "",
+            ]
+        )
+        index += 1
+    output_path.write_text("\n".join(cue_lines), encoding="utf-8")
 
 
 def should_skip_existing_output(
@@ -480,6 +516,237 @@ def should_skip_existing_output(
         log_skipped(project_root, media["input_path"], "subtitle already exists")
         return True
     return False
+
+
+def import_whisper_dependencies() -> tuple[Any, Any]:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as error:
+        raise DependencyError(
+            "Virtual environment exists but dependencies are incomplete. "
+            "Please rerun install_cpu.bat or install_gpu.bat."
+        ) from error
+
+    try:
+        import ctranslate2
+    except ImportError as error:
+        raise DependencyError(
+            "Virtual environment exists but dependencies are incomplete. "
+            "Please rerun install_cpu.bat or install_gpu.bat."
+        ) from error
+
+    return WhisperModel, ctranslate2
+
+
+def cuda_available_in_python(ctranslate2_module: Any) -> bool:
+    try:
+        get_count = getattr(ctranslate2_module, "get_cuda_device_count")
+        return int(get_count()) > 0
+    except Exception:
+        pass
+
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def choose_processing_plan(
+    project_root: Path, ctranslate2_module: Any, args: argparse.Namespace
+) -> dict[str, str]:
+    cuda_available = cuda_available_in_python(ctranslate2_module)
+    if args.device:
+        device = args.device
+        if device == "cuda" and cuda_available:
+            print("CUDA GPU detected. Using GPU acceleration.")
+        elif device == "cuda":
+            print("No CUDA GPU detected. Using CPU processing.")
+            device = "cpu"
+        else:
+            print("No CUDA GPU detected. Using CPU processing.")
+    elif cuda_available:
+        print("CUDA GPU detected. Using GPU acceleration.")
+        device = "cuda"
+    else:
+        print("No CUDA GPU detected. Using CPU processing.")
+        device = "cpu"
+
+    model_name = args.model or ("medium" if device == "cuda" else "small")
+    compute_type = "float16" if device == "cuda" else "int8"
+    if device == "cpu" and model_name != "small" and not args.model:
+        model_name = "small"
+    if device == "cuda" and model_name != "medium" and not args.model:
+        model_name = "medium"
+
+    return {
+        "device": device,
+        "model_name": model_name,
+        "model_dir": str(project_root / "models" / model_name),
+        "compute_type": compute_type,
+    }
+
+
+def verify_model_files(project_root: Path, model_name: str) -> Path:
+    model_dir = project_root / "models" / model_name
+    missing = [name for name in REQUIRED_MODEL_FILES if not (model_dir / name).exists()]
+    if missing:
+        raise ModelFilesError(
+            "Model files are incomplete. Please rerun download_models.bat."
+        )
+    return model_dir
+
+
+def load_whisper_model(
+    WhisperModel: Any,
+    project_root: Path,
+    model_name: str,
+    device: str,
+    compute_type: str,
+) -> Any:
+    model_dir = verify_model_files(project_root, model_name)
+    return WhisperModel(str(model_dir), device=device, compute_type=compute_type)
+
+
+def is_cuda_failure(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "cuda",
+            "vram",
+            "out of memory",
+            "out-of-memory",
+            "ctranslate2",
+            "cublas",
+            "cudnn",
+        )
+    )
+
+
+def transcribe_with_whisper(
+    WhisperModel: Any,
+    project_root: Path,
+    config: dict[str, Any],
+    audio_path: Path,
+    language: str | None,
+    plan: dict[str, str],
+) -> dict[str, Any]:
+    attempts: list[dict[str, str]] = [dict(plan)]
+    if plan["device"] == "cuda":
+        attempts.append(
+            {
+                "device": "cuda",
+                "model_name": "medium",
+                "model_dir": str(project_root / "models" / "medium"),
+                "compute_type": "int8_float16",
+            }
+        )
+        attempts.append(
+            {
+                "device": "cpu",
+                "model_name": "small",
+                "model_dir": str(project_root / "models" / "small"),
+                "compute_type": "int8",
+            }
+        )
+
+    last_error: Exception | None = None
+    for attempt_index, attempt in enumerate(attempts, start=1):
+        try:
+            model = load_whisper_model(
+                WhisperModel,
+                project_root,
+                attempt["model_name"],
+                attempt["device"],
+                attempt["compute_type"],
+            )
+            transcribe_args: dict[str, Any] = {
+                "task": "translate",
+                "beam_size": config["beam_size"],
+            }
+            if language is not None:
+                transcribe_args["language"] = language
+            segments, info = model.transcribe(str(audio_path), **transcribe_args)
+            segment_list = list(segments)
+            detected_language = info.language
+            return {
+                "segments": segment_list,
+                "detected_language": detected_language,
+                "device": attempt["device"],
+                "model_name": attempt["model_name"],
+                "compute_type": attempt["compute_type"],
+            }
+        except ModelFilesError:
+            raise
+        except Exception as error:
+            last_error = error
+            if plan["device"] == "cuda" and is_cuda_failure(error):
+                if attempt_index == 1:
+                    log_line(
+                        project_root,
+                        "error.log",
+                        "CUDA processing failed. Retrying GPU with int8_float16.",
+                    )
+                    continue
+                if attempt_index == 2:
+                    log_line(
+                        project_root,
+                        "error.log",
+                        "CUDA retry failed. Falling back to CPU small model.",
+                    )
+                    continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Faster-Whisper transcription did not produce a result.")
+
+
+def log_success(
+    project_root: Path,
+    input_path: Path,
+    output_path: Path,
+    language: str | None,
+    detected_language: str | None,
+    device: str,
+    model_name: str,
+) -> None:
+    log_line(
+        project_root,
+        "success.log",
+        (
+            f'input="{input_path}" output="{output_path}" language="{language}" '
+            f'detected_language="{detected_language}" device="{device}" '
+            f'model="{model_name}"'
+        ),
+    )
+
+
+def update_processed_registry(
+    project_root: Path,
+    registry: dict[str, Any],
+    input_path: Path,
+    output_path: Path,
+    language: str | None,
+    detected_language: str | None,
+    device: str,
+    model_name: str,
+) -> None:
+    stat = input_path.stat()
+    registry.setdefault("files", {})[str(input_path)] = {
+        "input_path": str(input_path),
+        "file_size": stat.st_size,
+        "modified_time": stat.st_mtime,
+        "output_path": str(output_path),
+        "language": language,
+        "detected_language": detected_language,
+        "device": device,
+        "model": model_name,
+        "completion_time": datetime.now().isoformat(timespec="seconds"),
+    }
+    atomic_json_write(project_root / "processed" / "processed_files.json", registry)
 
 
 def print_dry_run(media_files: list[dict[str, Any]], project_root: Path) -> None:
@@ -498,8 +765,10 @@ def print_dry_run(media_files: list[dict[str, Any]], project_root: Path) -> None
 def process_media_files(
     project_root: Path,
     config: dict[str, Any],
+    registry: dict[str, Any],
     media_files: list[dict[str, Any]],
     overwrite: bool,
+    args: argparse.Namespace,
 ) -> tuple[int, int, int]:
     processed = 0
     skipped = 0
@@ -507,6 +776,16 @@ def process_media_files(
 
     if not media_files:
         return processed, skipped, failed
+
+    try:
+        WhisperModel, ctranslate2_module = import_whisper_dependencies()
+        plan = choose_processing_plan(project_root, ctranslate2_module, args)
+        verify_model_files(project_root, plan["model_name"])
+    except (DependencyError, ModelFilesError) as error:
+        print(str(error))
+        for media in media_files:
+            log_error(project_root, media["input_path"], str(error))
+        return 0, 0, len(media_files)
 
     try:
         ffmpeg_path, ffprobe_path = verify_ffmpeg(project_root)
@@ -522,6 +801,8 @@ def process_media_files(
         print(f"File {index} of {len(media_files)}")
         print(f"Current file: {input_path}")
         print(f"Output path: {output_path}")
+        print(f"Selected device: {plan['device']}")
+        print(f"Selected model: {plan['model_name']}")
 
         if should_skip_existing_output(project_root, media, config, overwrite):
             skipped += 1
@@ -542,10 +823,48 @@ def process_media_files(
             print("Failed: extracted WAV validation failed.")
             continue
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        write_placeholder_srt(output_path, input_path)
+        try:
+            transcription = transcribe_with_whisper(
+                WhisperModel,
+                project_root,
+                config,
+                temp_wav_path,
+                media["language"],
+                plan,
+            )
+            write_transcribed_srt(output_path, transcription["segments"])
+            log_success(
+                project_root,
+                input_path,
+                output_path,
+                media["language"],
+                transcription["detected_language"],
+                transcription["device"],
+                transcription["model_name"],
+            )
+            update_processed_registry(
+                project_root,
+                registry,
+                input_path,
+                output_path,
+                media["language"],
+                transcription["detected_language"],
+                transcription["device"],
+                transcription["model_name"],
+            )
+        except ModelFilesError as error:
+            failed += 1
+            log_error(project_root, input_path, str(error))
+            print(f"Failed: {error}")
+            continue
+        except Exception as error:
+            failed += 1
+            log_error(project_root, input_path, f"Faster-Whisper failed: {error}")
+            print("Failed: Faster-Whisper processing failed.")
+            continue
+
         processed += 1
-        print("Processed: placeholder subtitle written.")
+        print("Processed: subtitle written.")
 
         if config["cleanup_temp"] and temp_wav_path.exists():
             temp_wav_path.unlink()
@@ -559,7 +878,7 @@ def main() -> int:
     ensure_directories(project_root)
     set_local_environment(project_root)
     config = load_config(project_root)
-    load_processed_registry(project_root)
+    registry = load_processed_registry(project_root)
 
     try:
         media_files = scan_requested_media(project_root, config, args.input)
@@ -572,7 +891,7 @@ def main() -> int:
         return 0
 
     processed, skipped, failed = process_media_files(
-        project_root, config, media_files, args.overwrite
+        project_root, config, registry, media_files, args.overwrite, args
     )
     print()
     print(f"Processed: {processed}")
