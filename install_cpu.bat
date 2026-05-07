@@ -1,7 +1,9 @@
 @echo off
 setlocal EnableExtensions
 
+REM Add local Python 3.11 to PATH priority
 set "ROOT=%~dp0"
+set "PATH=%ROOT%python 3.11;%ROOT%python 3.11\Scripts;%PATH%"
 set "VENV_DIR=%ROOT%.venv"
 set "VENV_PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "REQUIREMENTS=%ROOT%requirements.txt"
