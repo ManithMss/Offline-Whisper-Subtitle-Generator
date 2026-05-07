@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import subprocess
+import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +89,9 @@ REQUIRED_MODEL_FILES = (
     "tokenizer.json",
     "vocabulary.txt",
 )
+
+LOGGERS: dict[str, logging.Logger] = {}
+PENDING_RECOVERY_EVENTS: list[tuple[str, str]] = []
 
 
 class ConfigValidationError(ValueError):
@@ -185,7 +191,9 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 def recover_corrupt_config(project_root: Path, config_path: Path) -> dict[str, Any]:
     recovered_path = project_root / f"config.corrupt.{timestamp_for_filename()}.json"
     config_path.replace(recovered_path)
-    print(f"Corrupt config.json renamed to {recovered_path.name}.")
+    message = f"Corrupt config.json renamed to {recovered_path.name}."
+    print(message)
+    PENDING_RECOVERY_EVENTS.append(("error.log", message))
     return create_default_config(project_root)
 
 
@@ -230,9 +238,11 @@ def recover_corrupt_processed_registry(
         / f"processed_files.corrupt.{timestamp_for_filename()}.json"
     )
     registry_path.replace(recovered_path)
-    print(f"Corrupt processed registry renamed to {recovered_path.name}.")
+    message = f"Corrupt processed registry renamed to {recovered_path.name}."
+    print(message)
     registry = default_processed_registry()
     atomic_json_write(registry_path, registry)
+    log_line(project_root, "error.log", message)
     return registry
 
 
@@ -261,6 +271,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Scan without processing.")
     parser.add_argument("--input", type=Path, help="Process one media file.")
+    parser.add_argument("positional_input", nargs="?", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -268,10 +279,54 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", choices=("cpu", "cuda"), help="Override device.")
     parser.add_argument("--model", choices=("small", "medium"), help="Override model.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.input is not None and args.positional_input is not None:
+        parser.error("Use either --input or a positional input path, not both.")
+    if args.input is None:
+        args.input = args.positional_input
+    return args
 
 
-def log_line(project_root: Path, log_name: str, message: str) -> None:
+def setup_logging(project_root: Path, config: dict[str, Any]) -> None:
+    log_dir = project_root / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    for log_name in ("success.log", "error.log", "skipped.log"):
+        logger = logging.getLogger(f"subtitle_generator.{log_name}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+        handler = RotatingFileHandler(
+            log_dir / log_name,
+            maxBytes=config["log_max_bytes"],
+            backupCount=config["log_backup_count"],
+            encoding="utf-8",
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        LOGGERS[log_name] = logger
+
+
+def flush_pending_recovery_events(project_root: Path) -> None:
+    while PENDING_RECOVERY_EVENTS:
+        log_name, message = PENDING_RECOVERY_EVENTS.pop(0)
+        log_line(project_root, log_name, message)
+
+
+def log_line(
+    project_root: Path,
+    log_name: str,
+    message: str,
+    level: int = logging.INFO,
+    exc_info: bool = False,
+) -> None:
+    logger = LOGGERS.get(log_name)
+    if logger is not None:
+        logger.log(level, message, exc_info=exc_info)
+        return
+
     log_path = project_root / "logs" / log_name
     log_path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().isoformat(timespec="seconds")
@@ -279,8 +334,16 @@ def log_line(project_root: Path, log_name: str, message: str) -> None:
         log_file.write(f"{timestamp} {message}\n")
 
 
-def log_error(project_root: Path, input_path: Path, message: str) -> None:
-    log_line(project_root, "error.log", f'input="{input_path}" error="{message}"')
+def log_error(
+    project_root: Path, input_path: Path, message: str, exc_info: bool = False
+) -> None:
+    log_line(
+        project_root,
+        "error.log",
+        f'input="{input_path}" error="{message}"',
+        level=logging.ERROR,
+        exc_info=exc_info,
+    )
 
 
 def log_skipped(project_root: Path, input_path: Path, reason: str) -> None:
@@ -604,6 +667,36 @@ def should_skip_existing_output(
     return False
 
 
+def registry_entry_matches_file(entry: dict[str, Any], input_path: Path) -> bool:
+    stat = input_path.stat()
+    entry_size = entry.get("size", entry.get("file_size"))
+    entry_mtime = entry.get("mtime", entry.get("modified_time"))
+    return entry_size == stat.st_size and entry_mtime == stat.st_mtime
+
+
+def should_skip_processed_file(
+    project_root: Path,
+    registry: dict[str, Any],
+    media: dict[str, Any],
+    overwrite: bool,
+) -> bool:
+    if overwrite:
+        return False
+
+    input_path = media["input_path"]
+    output_path = media["output_path"]
+    entry = registry.get("files", {}).get(str(input_path))
+    if not isinstance(entry, dict):
+        return False
+    if not output_path.exists():
+        return False
+    if not registry_entry_matches_file(entry, input_path):
+        return False
+
+    log_skipped(project_root, input_path, "already processed and unchanged")
+    return True
+
+
 def import_whisper_dependencies() -> tuple[Any, Any]:
     try:
         from faster_whisper import WhisperModel
@@ -798,6 +891,7 @@ def log_success(
     detected_language: str | None,
     device: str,
     model_name: str,
+    duration: float | None,
 ) -> None:
     log_line(
         project_root,
@@ -805,7 +899,7 @@ def log_success(
         (
             f'input="{input_path}" output="{output_path}" language="{language}" '
             f'detected_language="{detected_language}" device="{device}" '
-            f'model="{model_name}"'
+            f'model="{model_name}" duration="{duration}"'
         ),
     )
 
@@ -819,20 +913,47 @@ def update_processed_registry(
     detected_language: str | None,
     device: str,
     model_name: str,
+    duration: float | None,
 ) -> None:
     stat = input_path.stat()
     registry.setdefault("files", {})[str(input_path)] = {
         "input_path": str(input_path),
+        "path": str(input_path),
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
         "file_size": stat.st_size,
         "modified_time": stat.st_mtime,
         "output_path": str(output_path),
+        "output": str(output_path),
         "language": language,
         "detected_language": detected_language,
         "device": device,
         "model": model_name,
         "completion_time": datetime.now().isoformat(timespec="seconds"),
+        "duration": duration,
     }
     atomic_json_write(project_root / "processed" / "processed_files.json", registry)
+
+
+def format_runtime(seconds: float) -> str:
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+
+def log_runtime_summary(
+    project_root: Path, processed: int, skipped: int, failed: int, started_at: float
+) -> None:
+    runtime = format_runtime(time.monotonic() - started_at)
+    log_line(
+        project_root,
+        "success.log",
+        (
+            f'total_runtime="{runtime}" processed="{processed}" '
+            f'skipped="{skipped}" failed="{failed}"'
+        ),
+    )
 
 
 def print_dry_run(media_files: list[dict[str, Any]], project_root: Path) -> None:
@@ -855,23 +976,27 @@ def process_media_files(
     media_files: list[dict[str, Any]],
     overwrite: bool,
     args: argparse.Namespace,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, str | None, str | None]:
     processed = 0
     skipped = 0
     failed = 0
+    summary_device: str | None = None
+    summary_model: str | None = None
 
     if not media_files:
-        return processed, skipped, failed
+        return processed, skipped, failed, summary_device, summary_model
 
     try:
         WhisperModel, ctranslate2_module = import_whisper_dependencies()
         plan = choose_processing_plan(project_root, ctranslate2_module, args)
+        summary_device = plan["device"]
+        summary_model = plan["model_name"]
         verify_model_files(project_root, plan["model_name"])
     except (DependencyError, ModelFilesError) as error:
         print(str(error))
         for media in media_files:
             log_error(project_root, media["input_path"], str(error))
-        return 0, 0, len(media_files)
+        return 0, 0, len(media_files), summary_device, summary_model
 
     try:
         ffmpeg_path, ffprobe_path = verify_ffmpeg(project_root)
@@ -879,7 +1004,7 @@ def process_media_files(
         print(str(error))
         for media in media_files:
             log_error(project_root, media["input_path"], str(error))
-        return 0, 0, len(media_files)
+        return 0, 0, len(media_files), summary_device, summary_model
 
     for index, media in enumerate(media_files, start=1):
         input_path = media["input_path"]
@@ -889,6 +1014,11 @@ def process_media_files(
         print(f"Output path: {output_path}")
         print(f"Selected device: {plan['device']}")
         print(f"Selected model: {plan['model_name']}")
+
+        if should_skip_processed_file(project_root, registry, media, overwrite):
+            skipped += 1
+            print("Skipped: already processed and unchanged.")
+            continue
 
         if should_skip_existing_output(project_root, media, config, overwrite):
             skipped += 1
@@ -909,6 +1039,8 @@ def process_media_files(
             print("Failed: extracted WAV validation failed.")
             continue
 
+        duration = probe_wav_duration(project_root, temp_wav_path, ffprobe_path, input_path)
+
         try:
             transcription = transcribe_with_whisper(
                 WhisperModel,
@@ -919,6 +1051,8 @@ def process_media_files(
                 plan,
             )
             write_transcribed_srt(output_path, transcription["segments"], config)
+            summary_device = transcription["device"]
+            summary_model = transcription["model_name"]
             log_success(
                 project_root,
                 input_path,
@@ -927,6 +1061,7 @@ def process_media_files(
                 transcription["detected_language"],
                 transcription["device"],
                 transcription["model_name"],
+                duration,
             )
             update_processed_registry(
                 project_root,
@@ -937,6 +1072,7 @@ def process_media_files(
                 transcription["detected_language"],
                 transcription["device"],
                 transcription["model_name"],
+                duration,
             )
         except ModelFilesError as error:
             failed += 1
@@ -945,7 +1081,12 @@ def process_media_files(
             continue
         except Exception as error:
             failed += 1
-            log_error(project_root, input_path, f"Faster-Whisper failed: {error}")
+            log_error(
+                project_root,
+                input_path,
+                f"Faster-Whisper failed: {error}",
+                exc_info=True,
+            )
             print("Failed: Faster-Whisper processing failed.")
             continue
 
@@ -955,35 +1096,53 @@ def process_media_files(
         if config["cleanup_temp"] and temp_wav_path.exists():
             temp_wav_path.unlink()
 
-    return processed, skipped, failed
+    return processed, skipped, failed, summary_device, summary_model
 
 
 def main() -> int:
+    started_at = time.monotonic()
     args = parse_args()
     project_root = get_project_root()
     ensure_directories(project_root)
     set_local_environment(project_root)
     config = load_config(project_root)
+    setup_logging(project_root, config)
+    flush_pending_recovery_events(project_root)
     registry = load_processed_registry(project_root)
 
     try:
         media_files = scan_requested_media(project_root, config, args.input)
     except (FileNotFoundError, ValueError) as error:
         print(f"ERROR: {error}")
+        log_line(project_root, "error.log", f"startup_error={error}", level=logging.ERROR)
+        log_runtime_summary(project_root, 0, 0, 1, started_at)
         return 1
 
     if args.dry_run:
         print_dry_run(media_files, project_root)
+        log_runtime_summary(project_root, 0, 0, 0, started_at)
         return 0
 
-    processed, skipped, failed = process_media_files(
+    processed, skipped, failed, device_used, model_used = process_media_files(
         project_root, config, registry, media_files, args.overwrite, args
     )
+    runtime = format_runtime(time.monotonic() - started_at)
     print()
     print(f"Processed: {processed}")
     print(f"Skipped: {skipped}")
     print(f"Failed: {failed}")
+    print(f"Total Runtime: {runtime}")
     print(f"Output Folder: {project_root / 'output_subtitles'}")
+    if device_used:
+        device_label = "GPU" if device_used == "cuda" else "CPU"
+        print(f"Device Used: {device_label}")
+    else:
+        print("Device Used: unavailable")
+    if model_used:
+        print(f"Model Used: {model_used}")
+    else:
+        print("Model Used: unavailable")
+    log_runtime_summary(project_root, processed, skipped, failed, started_at)
     if failed:
         return 1
     return 0
