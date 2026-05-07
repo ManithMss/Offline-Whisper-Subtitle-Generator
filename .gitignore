@@ -1,0 +1,68 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Specific local Python installation folder
+python 3.11/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+*.egg
+.eggs/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints
+
+# Pyenv
+.python-version
+
+# Mypy
+.mypy_cache/
+
+# Logs, caches, temporary files
+logs/
+cache/
+temp/
+tmp/
+
+# Large local folders and binaries not needed in repo
+ffmpeg/
+torch/
+models/
+output_subtitles/
+
+# Misc
+*.bak
+*.swp
