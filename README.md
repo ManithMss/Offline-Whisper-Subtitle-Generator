@@ -1,259 +1,169 @@
 # Offline Whisper Subtitle Generator
 
-Generate English `.srt` subtitle files locally on Windows from video and audio
-files. The project uses local FFmpeg plus Faster-Whisper models. After setup,
-subtitle generation runs offline and does not use OpenAI, paid APIs, or cloud
-subtitle services.
+Complete step-by-step guide to set up and run the project on Windows so any
+user can install prerequisites, download models and FFmpeg, and produce
+English `.srt` subtitle files without extra guidance.
 
-## Put The Project On D Drive
+Supported OS: Windows 10 / 11 (PowerShell or CMD).
 
-Place the project somewhere with enough free space, for example:
+IMPORTANT: run BAT files from an interactive Windows CMD or PowerShell window
+with normal user permissions. Do not run installs inside an IDE terminal
+unless you know it inherits the correct PATH and permissions.
 
-```text
+Project location
+----------------
+Place the project where you have disk space (prefer D:). Example:
+
+```
 D:\WhisperSubtitleProject\
 ```
 
-All project files, models, cache, logs, temporary audio, FFmpeg binaries, and
-subtitle outputs stay inside this project folder. Python itself may be installed
-on `C:`; the heavy files belong in the project folder.
+Everything large (models, FFmpeg, cache, temp, outputs, logs) stays inside
+the project folder. Python itself may be installed on `C:`.
 
-## First-Time Setup
+Quick command overview
+----------------------
+- `prerequisites\install_cpu.bat` — install CPU dependencies into `.venv`.
+- `prerequisites\install_gpu.bat` — install GPU dependencies into `.venv`.
+- `prerequisites\download_models.bat` — download Faster-Whisper small/medium.
+- `prerequisites\download_ffmpeg.bat` — download and install FFmpeg locally.
+- `run_subtitles.bat` — run subtitle generation (no installs or downloads).
+- `menu.bat` — interactive menu to call the prerequisite scripts.
 
-Run these BAT files from Windows CMD or PowerShell. Do not run package installs
-inside the AI IDE.
+Step-by-step setup (first run)
+------------------------------
+1) Verify you have a working Python 3.10 or 3.11 on PATH. To check:
 
-1. Download local FFmpeg:
-
-```bat
-download_ffmpeg.bat
+```powershell
+python -c "import sys; v=sys.version_info; print(f'{v.major}.{v.minor}')"
 ```
 
-2. Install dependencies. Use GPU if you have a supported NVIDIA CUDA setup:
+Acceptable outputs: `3.10` or `3.11`. If you get `3.12` or newer, install
+Python 3.11 and ensure it is used by the installers.
 
-```bat
-install_gpu.bat
+2) Open a new PowerShell or CMD in the project root (where this README is).
+
+3) Run the interactive helper menu (recommended):
+
+```powershell
+menu.bat
 ```
 
-Use CPU if you do not have CUDA, or if GPU setup fails:
+Use the menu options to run any single prerequisite or the "Run ALL"
+sequence. The menu only calls the scripts in `prerequisites\` — it does not
+perform installs itself.
 
-```bat
-install_cpu.bat
+Manual single-step commands (no menu)
+------------------------------------
+If you prefer to run steps manually in order, run these commands from the
+project root (PowerShell or CMD):
+
+```powershell
+prerequisites\download_ffmpeg.bat
+prerequisites\install_cpu.bat    # or prerequisites\install_gpu.bat
+prerequisites\download_models.bat
 ```
 
-3. Download the Faster-Whisper models:
+Notes:
+- Use `install_gpu.bat` only if you have an NVIDIA GPU and the installer
+   detects a supported CUDA version. If GPU install fails, use `install_cpu.bat`.
+- `download_models.bat` downloads only `Systran/faster-whisper-small` and
+   `Systran/faster-whisper-medium` into `models\small` and `models\medium`.
 
-```bat
-download_models.bat
-```
+How to run the subtitle generator
+---------------------------------
+After prerequisites complete and `.venv` is present, run the main script:
 
-Only these models are downloaded:
-
-- `Systran/faster-whisper-small`
-- `Systran/faster-whisper-medium`
-
-## Add Media Files
-
-Put media files into one of these folders:
-
-```text
-videos\japanese\
-videos\russian\
-videos\hindi\
-videos\english\
-videos\auto_detect\
-```
-
-Language folders tell Whisper what language to expect. `auto_detect` lets
-Whisper detect the spoken language itself. Subtitles are always translated to
-English.
-
-Supported inputs:
-
-```text
-.mp4 .mkv .avi .mov .ts .mp3 .wav .m4a .flac
-```
-
-Nested folders are supported. For example:
-
-```text
-videos\japanese\season1\episode01.mkv
-output_subtitles\japanese\season1\episode01.en.srt
-```
-
-## Run Subtitle Generation
-
-Normal batch processing:
-
-```bat
+```powershell
 run_subtitles.bat
 ```
 
-Subtitles are written to:
+Common modes and examples:
+- Dry run (scan only): `run_subtitles.bat --dry-run`
+- Process a single file: `run_subtitles.bat "D:\Videos\movie file.mkv"`
+- Dry run a single file: `run_subtitles.bat --dry-run "D:\Videos\movie file.mkv"`
+- Overwrite existing subtitles: `run_subtitles.bat --overwrite`
 
-```text
-output_subtitles\
+Drag-and-drop: drag any media file onto `run_subtitles.bat` in Explorer to
+process that single file.
+
+What the installers do (summary)
+--------------------------------
+- Create `\.venv` if missing (inside project root).
+- Set local cache environment variables so Hugging Face, Torch and other
+   caches remain inside the project folder.
+- Upgrade `pip`, `setuptools`, and `wheel` then `pip install -r requirements.txt`.
+- `install_gpu.bat` attempts to detect CUDA via `nvidia-smi` and selects a
+   compatible PyTorch wheel index (cu118/cu121/cu124) — it verifies `torch.cuda.is_available()`.
+
+Where output files appear
+-------------------------
+- Subtitles: `output_subtitles\<lang>\...*.en.srt`
+- Temporary audio: `temp\audio_<uniquehash>.wav` (cleaned up if `cleanup_temp`)
+- Logs: `logs\success.log`, `logs\error.log`, `logs\skipped.log`
+- Process registry: `processed\processed_files.json`
+
+FFmpeg manual fallback
+----------------------
+If `download_ffmpeg.bat` cannot fetch the archive, manually download and
+copy `ffmpeg.exe` and `ffprobe.exe` into `ffmpeg\bin` from one of these
+sources:
+
+- https://www.gyan.dev/ffmpeg/builds/
+- https://github.com/BtbN/FFmpeg-Builds/releases
+
+After copying, verify in PowerShell (from project root):
+
+```powershell
+.
+ffmpeg\bin\ffmpeg.exe -version
+ffmpeg\bin\ffprobe.exe -version
 ```
 
-Existing subtitles are skipped by default.
+Configuration and tuning
+------------------------
+- Edit `config.json` for defaults. CLI flags override config for a single run.
+- Key values:
+   - `overwrite_existing` (bool)
+   - `recursive_scan` (bool)
+   - `cleanup_temp` (bool)
+   - `beam_size` (int >= 1)
+   - `max_chars_per_line` (int >= 10)
+   - `max_lines_per_subtitle` (int >= 1)
+   - `ffmpeg_timeout_seconds` (null = unlimited or positive integer)
 
-## Drag And Drop
+Troubleshooting (quick fixes)
+-----------------------------
+- If `.venv` exists but imports fail: rerun the matching installer (GPU or CPU).
+- If models show as incomplete, delete the partial folder and rerun
+   `download_models.bat` or manually fetch via Hugging Face.
+- If FFmpeg commands fail, verify `ffmpeg\bin` contains both `.exe` files and
+   check `ffmpeg.exe -version`.
+- Check logs in `logs\` for error details.
 
-Drag one media file onto `run_subtitles.bat` to process only that file.
+Advanced: force CPU or GPU for a single run
+-----------------------------------------
+You can override device and model per run (these override `config.json`):
 
-You can also run:
-
-```bat
-run_subtitles.bat "D:\Videos\movie file.mkv"
+```powershell
+run_subtitles.bat --device cpu
+run_subtitles.bat --device cuda --model medium
 ```
 
-## Dry Run
+Final quick test checklist (do these to confirm a healthy setup)
+----------------------------------------------------------------
+1. `menu.bat` opens and option-run calls the corresponding script.
+2. `prerequisites\download_ffmpeg.bat` places `ffmpeg\bin\ffmpeg.exe` and `ffmpeg\bin\ffprobe.exe`.
+3. `prerequisites\install_cpu.bat` or `prerequisites\install_gpu.bat` creates `.venv` and installs packages.
+4. `prerequisites\download_models.bat` populates `models\small` and `models\medium` with `model.bin`, `config.json`, `tokenizer.json`, `vocabulary.txt`.
+5. `run_subtitles.bat --dry-run` lists files and planned outputs without creating subtitles.
+6. Run a single small media file end-to-end; confirm `output_subtitles\<lang>\<name>.en.srt` appears and logs show success.
 
-Dry run scans files and shows what would happen. It does not run FFmpeg, run
-Whisper, write subtitles, or update `processed\processed_files.json`.
+Changed files
+-------------
+- `README.md` — updated to be a complete, step-by-step setup and run guide.
 
-```bat
-run_subtitles.bat --dry-run
-run_subtitles.bat --dry-run "D:\Videos\movie file.mkv"
-run_subtitles.bat "D:\Videos\movie file.mkv" --dry-run
-```
-
-## Overwrite Existing Subtitles
-
-Use this when you want to regenerate subtitles that already exist:
-
-```bat
-run_subtitles.bat --overwrite
-run_subtitles.bat --overwrite "D:\Videos\movie file.mkv"
-```
-
-You can also set this in `config.json`:
-
-```json
-"overwrite_existing": true
-```
-
-## Configuration
-
-Edit `config.json` to change runtime behavior.
-
-Useful settings:
-
-- `recursive_scan`: scan nested folders under each language folder.
-- `cleanup_temp`: delete temporary WAV files after successful processing.
-- `beam_size`: Whisper beam search size.
-- `max_chars_per_line`: default subtitle line width is `42`.
-- `max_lines_per_subtitle`: default is `2`.
-- `ffmpeg_timeout_seconds`: default is `null`, which means unlimited.
-- `write_srt_metadata_note`: default is `false`.
-
-Do not change `translate_to_english` unless you intentionally want to modify the
-project behavior. The default is English subtitles for every input language.
-
-## Manual FFmpeg Setup
-
-`download_ffmpeg.bat` is the normal path. If it cannot download FFmpeg:
-
-1. Download a Windows FFmpeg build from one of these sources:
-   - `https://www.gyan.dev/ffmpeg/builds/`
-   - `https://github.com/BtbN/FFmpeg-Builds/releases`
-2. Extract the ZIP.
-3. Copy these files into `ffmpeg\bin\`:
-   - `ffmpeg.exe`
-   - `ffprobe.exe`
-4. Run `run_subtitles.bat` again.
-
-The expected paths are:
-
-```text
-ffmpeg\bin\ffmpeg.exe
-ffmpeg\bin\ffprobe.exe
-```
-
-## Troubleshooting
-
-Missing FFmpeg:
-
-```text
-FFmpeg not found. Please run download_ffmpeg.bat first.
-```
-
-Run `download_ffmpeg.bat`, or use the manual FFmpeg setup above.
-
-Missing models:
-
-```text
-Whisper models not found. Please run download_models.bat first.
-```
-
-Run `download_models.bat`. If the download fails, check internet access and
-Hugging Face access, then rerun it.
-
-Python version issue:
-
-Use Python 3.11 if possible. Python 3.10 is accepted. Python 3.12 and newer are
-rejected by the installers for this setup.
-
-No CUDA detected:
-
-The runner will use CPU mode and the small model. This is expected on systems
-without a supported NVIDIA CUDA setup.
-
-GPU out of memory or CUDA failure:
-
-The Python runner retries GPU with a safer compute type, then falls back to CPU
-small if needed. Check `logs\error.log` for details.
-
-Dependency install failed:
-
-Rerun `install_gpu.bat` or `install_cpu.bat`. If GPU setup keeps failing, use
-`install_cpu.bat`.
-
-Corrupted video or audio:
-
-FFmpeg extraction or WAV validation may fail. The bad file is logged and the
-batch continues with the next file.
-
-Subtitles already exist:
-
-Existing `.srt` files are skipped by default. Use `--overwrite` or set
-`overwrite_existing` to `true` in `config.json`.
-
-Rerun safely:
-
-The project is designed to resume. Completed files are tracked in
-`processed\processed_files.json`; unchanged files with existing subtitles are
-skipped on the next run.
-
-## Logs And Resume Data
-
-Logs are written here:
-
-```text
-logs\success.log
-logs\error.log
-logs\skipped.log
-```
-
-Resume data is written here:
-
-```text
-processed\processed_files.json
-```
-
-If the registry or config JSON becomes corrupt, the app renames the corrupt file
-with a timestamp and recreates a clean one.
-
-## Final Test Checklist
-
-After setup, a healthy project should pass these checks:
-
-- `download_ffmpeg.bat` leaves `ffmpeg\bin\ffmpeg.exe` and `ffmpeg\bin\ffprobe.exe`.
-- `install_cpu.bat` or `install_gpu.bat` creates `.venv`.
-- `download_models.bat` fills `models\small\` and `models\medium\`.
-- `run_subtitles.bat --dry-run` lists media without creating subtitles.
-- Dragging one media file onto `run_subtitles.bat` processes only that file.
-- `.mp3`, `.mkv`, and `.ts` inputs scan correctly.
-- Nested media folders produce matching nested output folders.
-- Existing subtitles are skipped unless `--overwrite` is used.
-- Logs appear in `logs\`.
-- Final subtitles appear in `output_subtitles\`.
+If you want, I can also:
+- create or update `menu.bat` in the project root to match these instructions,
+   including the "Run ALL prerequisites in sequence" option, or
+- prepare a short troubleshooting script to collect environment info for support.
