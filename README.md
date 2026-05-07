@@ -159,11 +159,4 @@ Final quick test checklist (do these to confirm a healthy setup)
 5. `run_subtitles.bat --dry-run` lists files and planned outputs without creating subtitles.
 6. Run a single small media file end-to-end; confirm `output_subtitles\<lang>\<name>.en.srt` appears and logs show success.
 
-Changed files
--------------
-- `README.md` — updated to be a complete, step-by-step setup and run guide.
 
-If you want, I can also:
-- create or update `menu.bat` in the project root to match these instructions,
-   including the "Run ALL prerequisites in sequence" option, or
-- prepare a short troubleshooting script to collect environment info for support.
